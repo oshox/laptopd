@@ -1,0 +1,16 @@
+[Unit]
+Description=Stage a fresh wallpaper while the internal panel is dark
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/laptopd display-watch
+Restart=always
+RestartSec=2
+
+[Install]
+# default.target, NOT graphical-session.target: that target is only reached
+# once per login, so a unit WantedBy=graphical-session.target stays dead after
+# a user-manager restart. PartOf= above still ties stop/restart to the
+# graphical session; only auto-start goes through default.target.
+WantedBy=default.target
