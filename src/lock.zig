@@ -2,8 +2,10 @@
 //! output currently has on the desktop (from the wallpaper state file).
 //! Called by swayidle for the idle timeout, `loginctl lock-session` and
 //! before-sleep, so it must be fast and self-contained: no sway IPC, no
-//! network, just read the state file and start swaylock. Any problem falls
-//! back to a plain `swaylock -f` (which uses ~/.config/swaylock/config).
+//! network, just read the state file and start swaylock. With nothing usable
+//! in the state file (or if swaylock rejects an image) it falls back to the
+//! lock image configured before the randomizer, `~/.config/lockscreen.jpg`,
+//! and finally to a bare `swaylock -f`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -47,24 +49,39 @@ fn alreadyLocked(io: Io, gpa: Allocator) bool {
     return r.exited_zero;
 }
 
+/// `swaylock -f -i <default image>` when the pre-randomizer lock image exists
+/// (LOCKSCREEN_DEFAULT overrides the path), otherwise a bare `swaylock -f`.
+fn defaultArgs(io: Io, gpa: Allocator, environ: *std.process.Environ.Map, home: ?[]const u8) []const []const u8 {
+    const path = environ.get("LOCKSCREEN_DEFAULT") orelse blk: {
+        const h = home orelse return &.{ swaylock, "-f" };
+        break :blk std.fmt.allocPrint(gpa, "{s}/.config/lockscreen.jpg", .{h}) catch return &.{ swaylock, "-f" };
+    };
+    if (!(FsCtx{ .io = io }).exists(path)) return &.{ swaylock, "-f" };
+    return gpa.dupe([]const u8, &.{ swaylock, "-f", "-i", path }) catch &.{ swaylock, "-f" };
+}
+
 pub fn run(io: Io, gpa: Allocator, environ: *std.process.Environ.Map) !u8 {
     if (alreadyLocked(io, gpa)) return 0;
 
-    const plain: []const []const u8 = &.{ swaylock, "-f" };
-    const home = environ.get("HOME") orelse {
-        _ = proc.runInherited(io, plain) catch {};
-        return 0;
-    };
-    const current_file = try std.fmt.allocPrint(gpa, "{s}/.local/state/wallpaper/current", .{home});
-    var buf: [8192]u8 = undefined;
-    const content = Io.Dir.cwd().readFile(io, current_file, &buf) catch "";
-    const entries = state.parseState(gpa, content) catch &[_]state.Prev{};
-    const args = buildArgs(gpa, entries, FsCtx{ .io = io }) catch plain;
+    const bare: []const []const u8 = &.{ swaylock, "-f" };
+    const home = environ.get("HOME");
+    const fallback = defaultArgs(io, gpa, environ, home);
 
-    const ok = proc.runInherited(io, args) catch false;
-    // A bad image path makes swaylock exit non-zero without locking; make
-    // sure the screen still ends up locked.
-    if (!ok and args.len > plain.len) _ = proc.runInherited(io, plain) catch {};
+    var args = fallback;
+    if (home) |h| blk: {
+        const current_file = std.fmt.allocPrint(gpa, "{s}/.local/state/wallpaper/current", .{h}) catch break :blk;
+        var buf: [8192]u8 = undefined;
+        const content = Io.Dir.cwd().readFile(io, current_file, &buf) catch break :blk;
+        const entries = state.parseState(gpa, content) catch break :blk;
+        const built = buildArgs(gpa, entries, FsCtx{ .io = io }) catch break :blk;
+        if (built.len > bare.len) args = built; // at least one image
+    }
+
+    // A bad image makes swaylock exit non-zero without locking; step down the
+    // chain so the screen always ends up locked.
+    if (proc.runInherited(io, args) catch false) return 0;
+    if (args.ptr != fallback.ptr and (proc.runInherited(io, fallback) catch false)) return 0;
+    if (fallback.len > bare.len) _ = proc.runInherited(io, bare) catch {};
     return 0;
 }
 

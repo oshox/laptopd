@@ -2,8 +2,8 @@
 //! active output, a different one per output when the cache is big enough.
 //! Offline, instant — called at sway session start and right before the
 //! internal panel goes dark (staged while dark so the swap itself is never
-//! seen). Safe on an empty/missing cache: leaves the current wallpaper
-//! untouched.
+//! seen). With an empty/missing cache it falls back to the pre-randomizer
+//! wallpaper, `~/.config/background.jpg`.
 //!
 //! `restore` (also `laptopd wallpaper-restore`) re-applies the saved state.
 //!
@@ -79,6 +79,17 @@ fn swaymsgBg(io: Io, gpa: Allocator, output: []const u8, path: []const u8) bool 
     return r.exited_zero;
 }
 
+/// The wallpaper configured before the randomizer existed
+/// (`~/.config/background.jpg`, what sway's config sets). Used explicitly
+/// whenever there is no random pick to show, so the fallback is that image
+/// and not whatever happens to be on screen. WALLPAPER_DEFAULT overrides.
+fn applyDefault(io: Io, gpa: Allocator, environ: *std.process.Environ.Map, home: []const u8) void {
+    const path = environ.get("WALLPAPER_DEFAULT") orelse
+        (std.fmt.allocPrint(gpa, "{s}/.config/background.jpg", .{home}) catch return);
+    Io.Dir.accessAbsolute(io, path, .{}) catch return;
+    _ = swaymsgBg(io, gpa, wildcard, path);
+}
+
 /// Serializes everything that sets wallpapers (rotation at session start and
 /// the sway-reload restore can fire at the same moment). Blocking, but the
 /// critical sections are a few local `swaymsg` calls. The caller closes the
@@ -110,7 +121,7 @@ pub fn restore(io: Io, gpa: Allocator, environ: *std.process.Environ.Map) !u8 {
     defer if (lock) |l| l.close(io);
 
     var buf: [8192]u8 = undefined;
-    const content = Io.Dir.cwd().readFile(io, current_file, &buf) catch return 0;
+    const content = Io.Dir.cwd().readFile(io, current_file, &buf) catch "";
     const entries = try state.parseState(gpa, content);
 
     var first = true;
@@ -124,6 +135,8 @@ pub fn restore(io: Io, gpa: Allocator, environ: *std.process.Environ.Map) !u8 {
         }
         if (!std.mem.eql(u8, e.output, wildcard)) _ = swaymsgBg(io, gpa, e.output, e.path);
     }
+    // No state, or every saved image is gone.
+    if (first) applyDefault(io, gpa, environ, home);
     return 0;
 }
 
@@ -149,7 +162,8 @@ pub fn run(io: Io, gpa: Allocator, environ: *std.process.Environ.Map) !u8 {
     var candidates: std.ArrayList([]const u8) = .empty;
     {
         var d = Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch {
-            // Missing/unreadable cache dir — leave the current wallpaper untouched.
+            // Missing/unreadable cache dir: nothing to rotate through.
+            applyDefault(io, gpa, environ, home);
             return 0;
         };
         defer d.close(io);
@@ -161,7 +175,10 @@ pub fn run(io: Io, gpa: Allocator, environ: *std.process.Environ.Map) !u8 {
         }
     }
 
-    if (candidates.items.len == 0) return 0;
+    if (candidates.items.len == 0) {
+        applyDefault(io, gpa, environ, home);
+        return 0;
+    }
 
     // Outputs to paint: every active one, or just `*` if sway can't tell us.
     var names: std.ArrayList([]const u8) = .empty;
