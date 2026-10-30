@@ -8,6 +8,24 @@
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const sway = @import("sway.zig");
+const image_info = @import("image_info.zig");
+
+/// Largest fraction of an image `fill` may crop away to match the display's
+/// aspect ratio. 0.20 keeps 16:9 (10%) and 4:3 (17%) on a 16:10 panel.
+/// Override with WALLPAPER_MAX_CROP.
+const default_max_crop: f64 = 0.20;
+/// Enough to get past EXIF/ICC segments to a JPEG's SOF marker.
+const probe_bytes: usize = 256 * 1024;
+
+const Fit = struct {
+    size: sway.Size,
+    max_crop: f64,
+
+    fn accepts(self: Fit, info: image_info.Info) bool {
+        return image_info.fits(info, self.size.width, self.size.height, self.max_crop);
+    }
+};
 
 const max_files: usize = 40;
 const rate_limit_seconds: i64 = 20 * 3600;
@@ -50,7 +68,10 @@ fn sanitizeBingId(gpa: Allocator, urlbase: []const u8) ![]u8 {
     return out;
 }
 
-fn downloadToFile(client: *std.http.Client, io: Io, gpa: Allocator, url: []const u8, dest: []const u8) bool {
+/// Downloads `url`, and keeps it as `<dir>/<stem><ext>` only if it is a JPEG
+/// or PNG that fits the display (see `Fit`). The extension comes from the
+/// image's real type, not from the URL.
+fn downloadImage(client: *std.http.Client, io: Io, gpa: Allocator, url: []const u8, dir: []const u8, stem: []const u8, fit: Fit) bool {
     var aw: Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     const result = client.fetch(.{
@@ -61,7 +82,12 @@ fn downloadToFile(client: *std.http.Client, io: Io, gpa: Allocator, url: []const
     const body = aw.written();
     if (body.len == 0 or body.len > max_body_bytes) return false;
 
-    var tmp_buf: [1024]u8 = undefined;
+    const info = image_info.probe(body[0..@min(body.len, probe_bytes)]) orelse return false;
+    if (!fit.accepts(info)) return false;
+
+    var dest_buf: [1024]u8 = undefined;
+    const dest = std.fmt.bufPrint(&dest_buf, "{s}/{s}{s}", .{ dir, stem, info.ext() }) catch return false;
+    var tmp_buf: [1032]u8 = undefined;
     const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{dest}) catch return false;
     var f = Io.Dir.cwd().createFile(io, tmp, .{ .truncate = true }) catch return false;
     var closed = false;
@@ -90,19 +116,48 @@ fn fileExists(io: Io, path: []const u8) bool {
     return true;
 }
 
+/// True if `<dir>/<stem>` is already cached under either extension we write.
+fn isCached(io: Io, gpa: Allocator, dir: []const u8, stem: []const u8) bool {
+    for ([_][]const u8{ ".jpg", ".png" }) |ext| {
+        const p = std.fmt.allocPrint(gpa, "{s}/{s}{s}", .{ dir, stem, ext }) catch return true;
+        defer gpa.free(p);
+        if (fileExists(io, p)) return true;
+    }
+    return false;
+}
+
+/// Only files this command downloaded are ever judged or deleted; anything
+/// else in the directory is the user's own.
+fn isFetched(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "bing_") or std.mem.startsWith(u8, name, "apod_");
+}
+
 const CacheEntry = struct {
     path: []const u8,
     mtime_ns: i128,
 };
 
-/// Deletes all but the newest `max_files` entries in `dir` by mtime.
-fn pruneCache(io: Io, gpa: Allocator, dir: []const u8) void {
+/// Deletes downloaded files that no longer fit the display (e.g. fetched
+/// before the size check existed), then all but the newest `max_files`
+/// entries in `dir` by mtime. Images of unknown format are kept.
+fn pruneCache(io: Io, gpa: Allocator, dir: []const u8, fit: Fit) void {
     var entries: std.ArrayList(CacheEntry) = .empty;
     var d = Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return;
     defer d.close(io);
+    const head = gpa.alloc(u8, probe_bytes) catch return;
+    defer gpa.free(head);
     var it = d.iterate();
     while (it.next(io) catch null) |entry| {
         if (entry.kind != .file) continue;
+        if (isFetched(entry.name)) {
+            const bytes = d.readFile(io, entry.name, head) catch &[_]u8{};
+            if (image_info.probe(bytes)) |info| {
+                if (!fit.accepts(info)) {
+                    d.deleteFile(io, entry.name) catch {};
+                    continue;
+                }
+            }
+        }
         const stat = d.statFile(io, entry.name, .{}) catch continue;
         const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, entry.name }) catch continue;
         entries.append(gpa, .{ .path = full, .mtime_ns = stat.mtime.nanoseconds }) catch continue;
@@ -118,6 +173,20 @@ fn pruneCache(io: Io, gpa: Allocator, dir: []const u8) void {
     for (entries.items[max_files..]) |e| {
         Io.Dir.deleteFileAbsolute(io, e.path) catch {};
     }
+}
+
+/// Display size from sway (built-in panel preferred) and the crop limit from
+/// WALLPAPER_MAX_CROP; falls back to the gram16 panel size if sway can't be
+/// reached.
+fn displayFit(io: Io, gpa: Allocator, environ: *std.process.Environ.Map) Fit {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const size = if (sway.getOutputs(io, gpa, arena.allocator())) |outs| sway.target(outs) else sway.fallback;
+    const max_crop = if (environ.get("WALLPAPER_MAX_CROP")) |v|
+        std.fmt.parseFloat(f64, v) catch default_max_crop
+    else
+        default_max_crop;
+    return .{ .size = size, .max_crop = max_crop };
 }
 
 /// Tops up the wallpaper cache from Bing (last 8 days) and NASA APOD
@@ -152,6 +221,8 @@ pub fn run(io: Io, gpa: Allocator, environ: *std.process.Environ.Map) !u8 {
         if (age_s < rate_limit_seconds) return 0;
     } else |_| {}
 
+    const fit = displayFit(io, gpa, environ);
+
     var client = std.http.Client{ .allocator = gpa, .io = io };
     defer client.deinit();
 
@@ -163,10 +234,10 @@ pub fn run(io: Io, gpa: Allocator, environ: *std.process.Environ.Map) !u8 {
             for (bing.images) |img| {
                 if (img.urlbase.len == 0) continue;
                 const id = sanitizeBingId(gpa, img.urlbase) catch continue;
-                const out = std.fmt.allocPrint(gpa, "{s}/bing_{s}.jpg", .{ dir, id }) catch continue;
-                if (fileExists(io, out)) continue;
+                const stem = std.fmt.allocPrint(gpa, "bing_{s}", .{id}) catch continue;
+                if (isCached(io, gpa, dir, stem)) continue;
                 const url = std.fmt.allocPrint(gpa, "https://www.bing.com{s}_UHD.jpg", .{img.urlbase}) catch continue;
-                _ = downloadToFile(&client, io, gpa, url, out);
+                _ = downloadImage(&client, io, gpa, url, dir, stem, fit);
             }
         } else |_| {}
     }
@@ -180,16 +251,16 @@ pub fn run(io: Io, gpa: Allocator, environ: *std.process.Environ.Map) !u8 {
             if (std.json.parseFromSliceLeaky(ApodResponse, arena.allocator(), apod_json, .{ .ignore_unknown_fields = true })) |apod| {
                 if (std.mem.eql(u8, apod.media_type, "image")) {
                     const img_url = if (apod.hdurl.len > 0) apod.hdurl else apod.url;
-                    const out = std.fmt.allocPrint(gpa, "{s}/apod_{s}.jpg", .{ dir, apod.date }) catch "";
-                    if (img_url.len > 0 and out.len > 0 and !fileExists(io, out)) {
-                        _ = downloadToFile(&client, io, gpa, img_url, out);
+                    const stem = std.fmt.allocPrint(gpa, "apod_{s}", .{apod.date}) catch "";
+                    if (img_url.len > 0 and stem.len > 0 and !isCached(io, gpa, dir, stem)) {
+                        _ = downloadImage(&client, io, gpa, img_url, dir, stem, fit);
                     }
                 }
             } else |_| {}
         }
     }
 
-    pruneCache(io, gpa, dir);
+    pruneCache(io, gpa, dir, fit);
 
     var stamp_f = Io.Dir.cwd().createFile(io, stamp_path, .{ .truncate = true }) catch return 0;
     stamp_f.close(io);
@@ -242,4 +313,18 @@ test "ApodResponse defaults degrade gracefully on a video day (missing hdurl/url
     const parsed = try std.json.parseFromSliceLeaky(ApodResponse, arena.allocator(), sample, .{ .ignore_unknown_fields = true });
     try testing.expectEqualStrings("video", parsed.media_type);
     try testing.expectEqual(@as(usize, 0), parsed.hdurl.len);
+}
+
+test "isFetched only claims files this command downloads" {
+    try testing.expect(isFetched("bing_OHR.Foo_EN-US1.jpg"));
+    try testing.expect(isFetched("apod_2026-10-30.png"));
+    try testing.expect(!isFetched("my-photo.jpg"));
+    try testing.expect(!isFetched("Beach-1.tif"));
+}
+
+test "Fit rejects a tiny image and a portrait, accepts 4K 16:9, on a 2560x1600 panel" {
+    const fit: Fit = .{ .size = .{ .width = 2560, .height = 1600 }, .max_crop = default_max_crop };
+    try testing.expect(!fit.accepts(.{ .kind = .png, .width = 121, .height = 102 }));
+    try testing.expect(!fit.accepts(.{ .kind = .jpeg, .width = 3000, .height = 4500 }));
+    try testing.expect(fit.accepts(.{ .kind = .jpeg, .width = 3840, .height = 2160 }));
 }

@@ -105,6 +105,8 @@ test "isKnownAlias rejects the binary's own name and unrelated names" {
 test {
     _ = @import("proc.zig");
     _ = @import("io_wait.zig");
+    _ = @import("sway.zig");
+    _ = @import("image_info.zig");
     _ = @import("wallpaper_next.zig");
     _ = @import("wallpaper_fetch.zig");
     _ = @import("display_watch.zig");

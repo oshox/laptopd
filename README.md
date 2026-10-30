@@ -7,12 +7,12 @@ CI publishes `ghcr.io/oshox/laptopd:latest` (`FROM scratch`), imported by [lapto
 ## Subcommands
 | Command | What |
 |---|---|
-| `wallpaper-fetch` | Tops up `~/Pictures/wallpapers` from Bing's daily archive and NASA APOD (no key; `NASA_API_KEY` optional). Rate-limited to ~once/20h, flock-guarded, prunes to 40 files. |
-| `wallpaper-next` | Sets a random cached wallpaper via `swaymsg output * bg`. No-op on an empty cache. |
+| `wallpaper-fetch` | Tops up `~/Pictures/wallpapers` from Bing's daily archive and NASA APOD (no key; `NASA_API_KEY` optional). Rate-limited to ~once/20h, flock-guarded, prunes to 40 files. Keeps only JPEG/PNG images at least as large as the internal panel (read from sway, 2560×1600 if unreachable) that need at most 20% cropping to fill it (`WALLPAPER_MAX_CROP`), and names files by real type. Also drops previously fetched `bing_*`/`apod_*` files that no longer fit; other files in the folder are never touched. |
+| `wallpaper-next` | Sets a random cached wallpaper on each active output, a different image per output when possible and never repeating an output's last one (`output * bg` first, so outputs plugged in later get one too). No-op on an empty cache. |
 | `display-watch` | Resident user daemon: when the internal panel (`eDP-*`) goes dark (lid close / DPMS off), runs `wallpaper-next`, then `wallpaper-fetch` in a transient unit — so the swap is never seen. |
 
 `wallpaper-next` and `wallpaper-fetch` are also argv[0] aliases (symlinks to the binary) so sway config can call them
-directly. `WALLPAPER_DIR` overrides the cache dir; state lives in `~/.local/state/wallpaper/`.
+directly. `WALLPAPER_DIR` overrides the cache dir; state lives in `~/.local/state/wallpaper/` (`current` is one `output<TAB>path` line per output).
 
 Image layout: `/usr/bin/laptopd` + alias symlinks, `/usr/lib/systemd/user/laptopd-display-watch.service`.
 The user unit is enabled by a symlink in `~/.config/systemd/user/default.target.wants/` (laptop-config), and

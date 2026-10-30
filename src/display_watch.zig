@@ -19,20 +19,10 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const proc = @import("proc.zig");
 const iowait = @import("io_wait.zig");
+const sway = @import("sway.zig");
 
 const wallpaper_next_path = "/usr/bin/wallpaper-next";
 const wallpaper_fetch_path = "/usr/bin/wallpaper-fetch";
-
-/// The built-in panel is `eDP-1` on this machine, but match by prefix so a
-/// different connector index doesn't silently disable the watcher.
-fn isInternalOutput(name: []const u8) bool {
-    return std.mem.startsWith(u8, name, "eDP-");
-}
-
-const Output = struct {
-    name: []const u8 = "",
-    power: ?bool = null,
-};
 
 /// Pure transition rule: stage only on a genuine on -> off edge. `last` is
 /// null on the first read after (re)start, which therefore never stages.
@@ -40,21 +30,17 @@ fn shouldStage(last: ?bool, now: bool) bool {
     return last != null and last.? and !now;
 }
 
-fn internalPower(outputs: []const Output) ?bool {
+fn internalPower(outputs: []const sway.Output) ?bool {
     for (outputs) |o| {
-        if (isInternalOutput(o.name) and o.power != null) return o.power;
+        if (sway.isInternal(o.name) and o.power != null) return o.power;
     }
     return null;
 }
 
 fn queryPower(io: Io, gpa: Allocator) ?bool {
-    var r = proc.run(io, gpa, &.{ "/usr/bin/swaymsg", "-t", "get_outputs" }) catch return null;
-    defer r.deinit(gpa);
-    if (!r.exited_zero) return null;
-
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const outputs = std.json.parseFromSliceLeaky([]Output, arena.allocator(), r.stdout, .{ .ignore_unknown_fields = true }) catch return null;
+    const outputs = sway.getOutputs(io, gpa, arena.allocator()) orelse return null;
     return internalPower(outputs);
 }
 
@@ -152,7 +138,7 @@ test "internalPower finds eDP-1 among other outputs, ignoring unknown fields" {
     ;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const outputs = try std.json.parseFromSliceLeaky([]Output, arena.allocator(), sample, .{ .ignore_unknown_fields = true });
+    const outputs = try sway.parseOutputs(arena.allocator(), sample);
     try testing.expectEqual(@as(?bool, false), internalPower(outputs));
 }
 
@@ -160,7 +146,7 @@ test "internalPower yields null when there is no internal panel" {
     const sample = "[{\"name\":\"DP-3\",\"power\":true}]";
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const outputs = try std.json.parseFromSliceLeaky([]Output, arena.allocator(), sample, .{ .ignore_unknown_fields = true });
+    const outputs = try sway.parseOutputs(arena.allocator(), sample);
     try testing.expectEqual(@as(?bool, null), internalPower(outputs));
 }
 
