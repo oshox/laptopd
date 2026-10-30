@@ -5,6 +5,10 @@
 
 const std = @import("std");
 
+/// Default limit on how much of an image `fill` may crop away. 0.20 keeps
+/// 16:9 (10%) and 4:3 (17%) on a 16:10 panel and rejects portrait/ultrawide.
+pub const default_max_crop: f64 = 0.20;
+
 pub const Kind = enum { jpeg, png };
 
 pub const Info = struct {

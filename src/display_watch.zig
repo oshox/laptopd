@@ -54,11 +54,13 @@ fn stageWallpaper(io: Io, gpa: Allocator) void {
     var wn_result = proc.run(io, gpa, &.{wallpaper_next_path}) catch null;
     if (wn_result) |*r| r.deinit(gpa);
 
+    // RuntimeMaxSec: if the machine suspends mid-download the connection dies
+    // and the HTTP client would wait forever; systemd kills it instead.
     var tbuf: [24]u8 = undefined;
     const unit = std.fmt.allocPrint(gpa, "wallpaper-fetch-{s}", .{timestampSuffix(io, &tbuf)}) catch return;
     defer gpa.free(unit);
     var child = std.process.spawn(io, .{
-        .argv = &.{ "/usr/bin/systemd-run", "--user", "--collect", "--quiet", "--unit", unit, wallpaper_fetch_path },
+        .argv = &.{ "/usr/bin/systemd-run", "--user", "--collect", "--quiet", "--property=RuntimeMaxSec=180", "--unit", unit, wallpaper_fetch_path },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,

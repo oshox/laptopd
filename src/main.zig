@@ -18,22 +18,31 @@
 //!
 //! Subcommands:
 //!   wallpaper-next   set a random cached wallpaper
+//!   wallpaper-restore re-apply the last wallpapers (after a sway reload)
 //!   wallpaper-fetch  top up the wallpaper cache from Bing/NASA APOD
 //!   display-watch    stage a fresh wallpaper while the internal panel is dark
+//!   lock             run swaylock with each output's desktop wallpaper
+//!   login-image      pick a different random image for the SDDM login screen
 
 const std = @import("std");
 const wallpapernext = @import("wallpaper_next.zig");
 const wallpaperfetch = @import("wallpaper_fetch.zig");
 const displaywatch = @import("display_watch.zig");
+const lock = @import("lock.zig");
+const loginimage = @import("login_image.zig");
 
 const usage =
     \\usage: laptopd <subcommand>
-    \\   or: <argv0-alias>   (wallpaper-next, wallpaper-fetch)
+    \\   or: <argv0-alias>   (wallpaper-next, wallpaper-restore, wallpaper-fetch)
     \\
     \\subcommands:
     \\  wallpaper-next   set a random cached wallpaper
+    \\  wallpaper-restore re-apply the last wallpapers (after a sway reload)
     \\  wallpaper-fetch  top up the wallpaper cache from Bing/NASA APOD
     \\  display-watch    stage a fresh wallpaper while the internal panel is dark
+    \\  lock             run swaylock with each output's desktop wallpaper
+    \\  login-image      pick a different random image for the SDDM login screen
+    \\                   (--if-missing: only when there is none yet)
     \\
 ;
 
@@ -60,6 +69,13 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
+    if (std.mem.eql(u8, cmd, "wallpaper-restore")) {
+        std.process.exit(wallpapernext.restore(io, arena, init.environ_map) catch |err| {
+            std.debug.print("laptopd wallpaper-restore: unhandled error: {t}\n", .{err});
+            std.process.exit(1);
+        });
+    }
+
     if (std.mem.eql(u8, cmd, "wallpaper-fetch")) {
         std.process.exit(wallpaperfetch.run(io, arena, init.environ_map) catch |err| {
             std.debug.print("laptopd wallpaper-fetch: unhandled error: {t}\n", .{err});
@@ -74,6 +90,20 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
+    if (std.mem.eql(u8, cmd, "lock")) {
+        std.process.exit(lock.run(io, arena, init.environ_map) catch |err| {
+            std.debug.print("laptopd lock: unhandled error: {t}\n", .{err});
+            std.process.exit(1);
+        });
+    }
+
+    if (std.mem.eql(u8, cmd, "login-image")) {
+        std.process.exit(loginimage.run(io, arena, init.environ_map, &args) catch |err| {
+            std.debug.print("laptopd login-image: unhandled error: {t}\n", .{err});
+            std.process.exit(1);
+        });
+    }
+
     std.debug.print("laptopd: unknown subcommand {s}\n\n{s}", .{ cmd, usage });
     std.process.exit(2);
 }
@@ -82,7 +112,7 @@ pub fn main(init: std.process.Init) !void {
 /// allowlist (rather than "anything not literally named laptopd") so a stray
 /// or misnamed symlink fails loudly via the usage message.
 fn isKnownAlias(name: []const u8) bool {
-    const aliases = [_][]const u8{ "wallpaper-next", "wallpaper-fetch" };
+    const aliases = [_][]const u8{ "wallpaper-next", "wallpaper-fetch", "wallpaper-restore" };
     for (aliases) |a| {
         if (std.mem.eql(u8, name, a)) return true;
     }
@@ -94,6 +124,7 @@ const testing = std.testing;
 test "isKnownAlias recognizes the wallpaper aliases" {
     try testing.expect(isKnownAlias("wallpaper-next"));
     try testing.expect(isKnownAlias("wallpaper-fetch"));
+    try testing.expect(isKnownAlias("wallpaper-restore"));
 }
 
 test "isKnownAlias rejects the binary's own name and unrelated names" {
@@ -106,8 +137,11 @@ test {
     _ = @import("proc.zig");
     _ = @import("io_wait.zig");
     _ = @import("sway.zig");
+    _ = @import("state.zig");
     _ = @import("image_info.zig");
     _ = @import("wallpaper_next.zig");
     _ = @import("wallpaper_fetch.zig");
     _ = @import("display_watch.zig");
+    _ = @import("lock.zig");
+    _ = @import("login_image.zig");
 }

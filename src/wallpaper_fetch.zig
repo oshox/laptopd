@@ -11,10 +11,8 @@ const Allocator = std.mem.Allocator;
 const sway = @import("sway.zig");
 const image_info = @import("image_info.zig");
 
-/// Largest fraction of an image `fill` may crop away to match the display's
-/// aspect ratio. 0.20 keeps 16:9 (10%) and 4:3 (17%) on a 16:10 panel.
 /// Override with WALLPAPER_MAX_CROP.
-const default_max_crop: f64 = 0.20;
+const default_max_crop = image_info.default_max_crop;
 /// Enough to get past EXIF/ICC segments to a JPEG's SOF marker.
 const probe_bytes: usize = 256 * 1024;
 
@@ -149,6 +147,14 @@ fn pruneCache(io: Io, gpa: Allocator, dir: []const u8, fit: Fit) void {
     var it = d.iterate();
     while (it.next(io) catch null) |entry| {
         if (entry.kind != .file) continue;
+        if (std.mem.endsWith(u8, entry.name, ".tmp")) {
+            // Leftover from a download killed mid-flight (suspend, timeout).
+            if (d.statFile(io, entry.name, .{})) |st| {
+                const age_s = @divFloor(Io.Timestamp.now(io, .real).nanoseconds - st.mtime.nanoseconds, std.time.ns_per_s);
+                if (age_s > 3600) d.deleteFile(io, entry.name) catch {};
+            } else |_| {}
+            continue;
+        }
         if (isFetched(entry.name)) {
             const bytes = d.readFile(io, entry.name, head) catch &[_]u8{};
             if (image_info.probe(bytes)) |info| {
@@ -226,11 +232,17 @@ pub fn run(io: Io, gpa: Allocator, environ: *std.process.Environ.Map) !u8 {
     var client = std.http.Client{ .allocator = gpa, .io = io };
     defer client.deinit();
 
+    // The stamp is only written if at least one index request worked, so an
+    // offline run (e.g. just after a resume, before Wi-Fi is back) retries at
+    // the next trigger instead of waiting out the 20 h rate limit.
+    var index_ok = false;
+
     // --- Bing daily images (last 8 days) ---
     if (fetchBody(&client, gpa, "https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=8&mkt=en-US")) |bing_json| {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         if (std.json.parseFromSliceLeaky(BingResponse, arena.allocator(), bing_json, .{ .ignore_unknown_fields = true })) |bing| {
+            index_ok = true;
             for (bing.images) |img| {
                 if (img.urlbase.len == 0) continue;
                 const id = sanitizeBingId(gpa, img.urlbase) catch continue;
@@ -249,6 +261,7 @@ pub fn run(io: Io, gpa: Allocator, environ: *std.process.Environ.Map) !u8 {
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
             if (std.json.parseFromSliceLeaky(ApodResponse, arena.allocator(), apod_json, .{ .ignore_unknown_fields = true })) |apod| {
+                index_ok = true;
                 if (std.mem.eql(u8, apod.media_type, "image")) {
                     const img_url = if (apod.hdurl.len > 0) apod.hdurl else apod.url;
                     const stem = std.fmt.allocPrint(gpa, "apod_{s}", .{apod.date}) catch "";
@@ -262,6 +275,7 @@ pub fn run(io: Io, gpa: Allocator, environ: *std.process.Environ.Map) !u8 {
 
     pruneCache(io, gpa, dir, fit);
 
+    if (!index_ok) return 0;
     var stamp_f = Io.Dir.cwd().createFile(io, stamp_path, .{ .truncate = true }) catch return 0;
     stamp_f.close(io);
     return 0;

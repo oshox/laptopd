@@ -1,0 +1,15 @@
+[Unit]
+Description=Pick a new SDDM login-screen image when the session ends
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# First login after install: make sure there is an image to show.
+ExecStart=/usr/bin/laptopd login-image --if-missing
+# Runs when the user manager stops (logout / shutdown), never on suspend.
+# Local files only, so it can't hang on the network.
+ExecStop=/usr/bin/laptopd login-image
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

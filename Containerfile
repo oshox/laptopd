@@ -25,7 +25,7 @@ RUN zig build --cache-dir /tmp/zc --global-cache-dir /tmp/zgc \
 RUN zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux --cache-dir /tmp/zc --global-cache-dir /tmp/zgc
 COPY dist/ /out/
 RUN install -D -m0755 zig-out/bin/laptopd /out/usr/bin/laptopd \
-    && for a in wallpaper-fetch wallpaper-next; do ln -s laptopd /out/usr/bin/$a; done
+    && for a in wallpaper-fetch wallpaper-next wallpaper-restore; do ln -s laptopd /out/usr/bin/$a; done
 
 FROM scratch
 COPY --from=build /out/ /

@@ -5,6 +5,8 @@
 //! seen). Safe on an empty/missing cache: leaves the current wallpaper
 //! untouched.
 //!
+//! `restore` (also `laptopd wallpaper-restore`) re-applies the saved state.
+//!
 //! State: `~/.local/state/wallpaper/current` holds one `<output>\t<path>`
 //! line per output (a bare path from older versions is read as output `*`),
 //! used to avoid repeating each output's previous image.
@@ -12,6 +14,8 @@
 const std = @import("std");
 const proc = @import("proc.zig");
 const sway = @import("sway.zig");
+const state = @import("state.zig");
+const wildcard = state.wildcard;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -24,42 +28,6 @@ fn hasWallpaperExt(name: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(tail, ext)) return true;
     }
     return false;
-}
-
-const wildcard = "*";
-
-const Prev = struct {
-    output: []const u8,
-    /// File name (no directory) of the image that output last showed.
-    file: []const u8,
-};
-
-/// Parses the state file. Slices point into `content`; only the list itself
-/// is allocated.
-fn parseState(gpa: Allocator, content: []const u8) ![]Prev {
-    var list: std.ArrayList(Prev) = .empty;
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \r");
-        if (line.len == 0) continue;
-        const entry: Prev = if (std.mem.indexOfScalar(u8, line, '\t')) |t|
-            .{ .output = line[0..t], .file = std.fs.path.basename(line[t + 1 ..]) }
-        else
-            .{ .output = wildcard, .file = std.fs.path.basename(line) };
-        try list.append(gpa, entry);
-    }
-    return list.items;
-}
-
-/// What `output` showed last time: its own entry, else the legacy `*` entry.
-fn previousFor(prev: []const Prev, output: []const u8) []const u8 {
-    for (prev) |p| {
-        if (std.mem.eql(u8, p.output, output)) return p.file;
-    }
-    for (prev) |p| {
-        if (std.mem.eql(u8, p.output, wildcard)) return p.file;
-    }
-    return "";
 }
 
 /// Chooses one candidate per output. Preference order for each output:
@@ -111,6 +79,54 @@ fn swaymsgBg(io: Io, gpa: Allocator, output: []const u8, path: []const u8) bool 
     return r.exited_zero;
 }
 
+/// Serializes everything that sets wallpapers (rotation at session start and
+/// the sway-reload restore can fire at the same moment). Blocking, but the
+/// critical sections are a few local `swaymsg` calls. The caller closes the
+/// returned file to release; null (couldn't lock) means carry on unlocked.
+fn lockApply(io: Io, state_dir: []const u8, gpa: Allocator) ?Io.File {
+    const path = std.fmt.allocPrint(gpa, "{s}/apply.lock", .{state_dir}) catch return null;
+    const f = Io.Dir.cwd().createFile(io, path, .{ .truncate = false }) catch return null;
+    const rc = std.os.linux.flock(f.handle, std.posix.LOCK.EX);
+    if (std.posix.errno(rc) != .SUCCESS) {
+        f.close(io);
+        return null;
+    }
+    return f;
+}
+
+/// `laptopd wallpaper-restore` — re-applies the wallpapers recorded in the
+/// state file. Sway's `exec_always` runs it on every config reload, which
+/// otherwise resets the background to the static default in sway's config.
+/// A missing state file (or images that are gone) leaves that default alone.
+pub fn restore(io: Io, gpa: Allocator, environ: *std.process.Environ.Map) !u8 {
+    const home = environ.get("HOME") orelse {
+        std.debug.print("laptopd wallpaper-restore: $HOME is unset\n", .{});
+        return 1;
+    };
+    const state_dir = try std.fmt.allocPrint(gpa, "{s}/.local/state/wallpaper", .{home});
+    const current_file = try std.fmt.allocPrint(gpa, "{s}/current", .{state_dir});
+    Io.Dir.cwd().createDirPath(io, state_dir) catch {};
+    const lock = lockApply(io, state_dir, gpa);
+    defer if (lock) |l| l.close(io);
+
+    var buf: [8192]u8 = undefined;
+    const content = Io.Dir.cwd().readFile(io, current_file, &buf) catch return 0;
+    const entries = try state.parseState(gpa, content);
+
+    var first = true;
+    for (entries) |e| {
+        Io.Dir.accessAbsolute(io, e.path, .{}) catch continue;
+        // `output *` first (from the first usable entry) so outputs plugged
+        // in later also get a wallpaper, then each output's own on top.
+        if (first) {
+            if (!swaymsgBg(io, gpa, wildcard, e.path)) return 0;
+            first = false;
+        }
+        if (!std.mem.eql(u8, e.output, wildcard)) _ = swaymsgBg(io, gpa, e.output, e.path);
+    }
+    return 0;
+}
+
 /// Picks random cached wallpapers (avoiding a repeat of each output's
 /// current one when possible) and applies them via `swaymsg`.
 /// Always returns 0 — a missing cache, an unreadable directory, or a
@@ -127,6 +143,8 @@ pub fn run(io: Io, gpa: Allocator, environ: *std.process.Environ.Map) !u8 {
     const current_file = try std.fmt.allocPrint(gpa, "{s}/current", .{state_dir});
 
     Io.Dir.cwd().createDirPath(io, state_dir) catch {};
+    const lock = lockApply(io, state_dir, gpa);
+    defer if (lock) |l| l.close(io);
 
     var candidates: std.ArrayList([]const u8) = .empty;
     {
@@ -156,10 +174,10 @@ pub fn run(io: Io, gpa: Allocator, environ: *std.process.Environ.Map) !u8 {
     if (!per_output) try names.append(gpa, wildcard);
 
     var state_buf: [8192]u8 = undefined;
-    const state = Io.Dir.cwd().readFile(io, current_file, &state_buf) catch "";
-    const prev_entries = try parseState(gpa, state);
+    const content = Io.Dir.cwd().readFile(io, current_file, &state_buf) catch "";
+    const prev_entries = try state.parseState(gpa, content);
     const previous = try gpa.alloc([]const u8, names.items.len);
-    for (names.items, 0..) |n, i| previous[i] = previousFor(prev_entries, n);
+    for (names.items, 0..) |n, i| previous[i] = state.previousFor(prev_entries, n);
 
     var seed: [8]u8 = undefined;
     Io.random(io, &seed);
@@ -205,34 +223,6 @@ test "hasWallpaperExt rejects non-image files" {
 
 test "hasWallpaperExt matches a bare extension with no basename, like a *.jpg glob does" {
     try testing.expect(hasWallpaperExt(".jpg"));
-}
-
-test "parseState reads per-output lines and the legacy single-path format" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const modern = try parseState(a, "eDP-1\t/p/wp/a.jpg\nDP-3\t/p/wp/b.jpg\n");
-    try testing.expectEqual(@as(usize, 2), modern.len);
-    try testing.expectEqualStrings("eDP-1", modern[0].output);
-    try testing.expectEqualStrings("b.jpg", modern[1].file);
-
-    const legacy = try parseState(a, "/home/x/Pictures/wallpapers/old.jpg");
-    try testing.expectEqual(@as(usize, 1), legacy.len);
-    try testing.expectEqualStrings("*", legacy[0].output);
-    try testing.expectEqualStrings("old.jpg", legacy[0].file);
-
-    try testing.expectEqual(@as(usize, 0), (try parseState(a, "")).len);
-}
-
-test "previousFor prefers the exact output, then the legacy entry, then nothing" {
-    const prev = [_]Prev{
-        .{ .output = "eDP-1", .file = "a.jpg" },
-        .{ .output = "*", .file = "legacy.jpg" },
-    };
-    try testing.expectEqualStrings("a.jpg", previousFor(&prev, "eDP-1"));
-    try testing.expectEqualStrings("legacy.jpg", previousFor(&prev, "DP-3"));
-    try testing.expectEqualStrings("", previousFor(&.{}, "eDP-1"));
 }
 
 test "assign gives each output a distinct image and avoids the previous one" {
